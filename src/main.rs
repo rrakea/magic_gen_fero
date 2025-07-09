@@ -26,15 +26,19 @@ use rand_pcg::Pcg64;
             magic found!
         Reduce the shift size and search again
 */
-const MAGIC_TRIES: u64 = 100000;
+const MAGIC_TRIES: u64 = 10000000;
 const START_SHIFT: u32 = 14;
-const EDGE_MASK: u64 = 0;
-const MAX_BLOCKER_ROOK: usize = usize::pow(2, 14);
+const EDGE_MASK: u64 = 0b00000000_01111110_01111110_01111110_01111110_01111110_01111110_00000000;
+const MAX_BLOCKER_ROOK: usize = usize::pow(2, 12);
 const ROOK_OFFSETS: [i8; 4] = [1, -1, 8, -8];
 
 // This saves the masks of moves on an empty square
 static mut ROOK_PREMASK: [u64; 64] = [0; 64];
 static mut BISHOP_PREMASK: [u64; 64] = [0; 64];
+
+// This excludes the last
+static mut ROOK_PREMASK_TRUNC: [u64; 64] = [0; 64];
+static mut BISHOP_PREMASK_TRUNC: [u64; 64] = [0; 64];
 
 // The tupel saves the magic (u64) and the shift (u32)
 static mut ROOK_MAGIC: [(u64, u32); 64] = [(0, 0); 64];
@@ -47,12 +51,12 @@ static mut BISHOP_BLOCKERS: [u64; 64] = [0; 64];
 static mut ROOK_MOVE_WITH_BLOCKERS: [[u64; MAX_BLOCKER_ROOK]; 64] = [[0; MAX_BLOCKER_ROOK]; 64];
 
 fn main() {
-    // Sets ROOK_BLOCKERS and ROOK_MOVE_WITH_BLOCKERS
+    // Sets ROOK_PREMASK and ROOK_PREMASK_TRUNC
     init_piecemask();
-    // Sets ROOK_PREMASK
+    // Sets ROOK_BLOCKERS and ROOK_MOVE_WITH_BLOCKERS
     init_movemasks();
 
-    let test_premask = unsafe { ROOK_PREMASK[32] };
+    /* let test_premask = unsafe { ROOK_PREMASK[32] };
     let test_blocker = unsafe { ROOK_BLOCKERS[32][100] };
     let test_movemask = unsafe { ROOK_MOVE_WITH_BLOCKERS[32][100] };
     println!(
@@ -67,12 +71,17 @@ fn main() {
         test_premask, test_blocker, test_movemask
     );
 
+    println!("Printing Blockers: ");
+    for blocker in unsafe { ROOK_BLOCKERS[28] } {
+        println!("{:064b}", blocker);
+    } */
+
     let mut rng = Pcg64::from_os_rng();
 
     for sq in 0..64 {
         let move_mask = unsafe { ROOK_PREMASK[sq] };
         let shift_len = START_SHIFT;
-        'shifts: for shift in (12..shift_len).rev() {
+        'shifts: for shift in (0..shift_len).rev() {
             'magics: for _ in 0..MAGIC_TRIES {
                 // 2 ^ shift is the max amount we can reach
                 // since we truncate our index to that value
@@ -85,7 +94,12 @@ fn main() {
                 'blockers: for (blocker_index, blocker) in
                     unsafe { ROOK_BLOCKERS[sq] }.iter().enumerate()
                 {
-                    let blocker_mask = move_mask & blocker;
+                    // If we have reached the end of the ROOK_BLOCKERS array
+                    if *blocker == 0 && blocker_index > 0 {
+                        break 'blockers;
+                    }
+
+                    let blocker_mask = move_mask & *blocker;
                     let index = (blocker_mask * magic) >> (64 - shift);
                     let move_with_blocker = unsafe { ROOK_MOVE_WITH_BLOCKERS[sq][blocker_index] };
                     if move_lookup[index as usize] == 0 {
@@ -115,18 +129,24 @@ fn main() {
         }
     }
     for (sq, magic) in unsafe { ROOK_MAGIC }.iter().enumerate() {
-        println!("Sq: {}, Magic: {:064b}, Shift {}", sq, magic.0, magic.1);
+        println!("Sq: {}, Magic: {:016x}, Shift {}", sq, magic.0, magic.1);
     }
 }
 
 fn init_movemasks() {
     // Rook movemasks
     for sq in 0..64 {
-        let premask = unsafe { ROOK_PREMASK[sq] };
+        // let mut premask = unsafe { ROOK_PREMASK[sq] };
+        let trunc_premask = unsafe { ROOK_PREMASK_TRUNC[sq] };
 
-        for blocker_index in 0..MAX_BLOCKER_ROOK {
+        let mut blocker_index = 0;
+        let mut last_iteration = false;
+        loop {
             // Calculate all the possible relevant blocker positions
-            let blocker = gen_blockers(premask, blocker_index as u64);
+            let (blocker, reached_max) = gen_blockers(trunc_premask, blocker_index as u64);
+            if reached_max {
+                last_iteration = true;
+            }
             unsafe {
                 ROOK_BLOCKERS[sq][blocker_index] = blocker;
             };
@@ -156,16 +176,20 @@ fn init_movemasks() {
             unsafe {
                 ROOK_MOVE_WITH_BLOCKERS[sq][blocker_index] = movemask;
             }
+            blocker_index += 1;
+            if last_iteration {
+                break;
+            }
         }
     }
 }
 
-fn gen_blockers(mask: u64, counter: u64) -> u64 {
+fn gen_blockers(mask: u64, counter: u64) -> (u64, bool) {
     let mut res = 0;
     let mut counter_position = 0;
 
     for b in 0..64 {
-        // If the mask has a 1 at position i
+        // If the mask has a 1 at position b
         if (mask >> b) & 1 == 1 {
             // We only need to flip the bit in res if
             // the counter actually has a 1 in that position
@@ -176,7 +200,7 @@ fn gen_blockers(mask: u64, counter: u64) -> u64 {
             counter_position += 1;
         }
     }
-    res
+    (res, res == mask)
 }
 
 // This accomodates for knight moves
@@ -189,12 +213,14 @@ pub fn init_piecemask() {
     let rook_offsets = vec![1, -1, 8, -8];
 
     unsafe {
-        BISHOP_PREMASK = mask_from_offset(&bishop_offsets, 8);
-        ROOK_PREMASK = mask_from_offset(&rook_offsets, 8);
+        BISHOP_PREMASK = mask_from_offset(&bishop_offsets, 8, false);
+        ROOK_PREMASK = mask_from_offset(&rook_offsets, 8, false);
+        BISHOP_PREMASK_TRUNC = mask_from_offset(&bishop_offsets, 8, true);
+        ROOK_PREMASK_TRUNC = mask_from_offset(&rook_offsets, 8, true);
     }
 }
 
-fn mask_from_offset(offset: &Vec<i8>, iterator: i8) -> [u64; 64] {
+fn mask_from_offset(offset: &Vec<i8>, iterator: i8, truncate: bool) -> [u64; 64] {
     let mut mask = [0; 64];
 
     for sq in 0..64 {
@@ -206,6 +232,17 @@ fn mask_from_offset(offset: &Vec<i8>, iterator: i8) -> [u64; 64] {
                     && new_pos < 64
                     && no_wrap(((sq as i8) + (o * (i - 1))) as u8, new_pos as u8)
                 {
+                    // This checks if the next iteration will be out of bounds
+                    // If it is, then this must be on the edge
+                    // => If we are truncating then we must stop here
+                    let pos_in_next_iteration = (sq as i8) + (o * (i + 1));
+                    if truncate
+                        && (pos_in_next_iteration < 0
+                            || pos_in_next_iteration >= 64
+                            || !no_wrap(new_pos as u8, pos_in_next_iteration as u8))
+                    {
+                        break;
+                    }
                     pos_sq.push(new_pos as u8);
                 } else {
                     break;
